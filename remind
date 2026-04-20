@@ -59,6 +59,8 @@ case "$1" in
         # Write atq output to a temp file so we can read it twice
         # (a while-pipe subshell can't export variables to the parent)
         tmpfile=$(mktemp)
+        # Trap ensures tmpfiles are always cleaned up even if set -e aborts mid-list
+        trap 'rm -f "$tmpfile" "${tmpfile}.map"' EXIT
         atq > "$tmpfile"
 
         idx=1
@@ -121,7 +123,15 @@ case "$1" in
             echo "$ids" | xargs -r atrm 2>/dev/null || true
             count=$(echo "$ids" | wc -l)
             echo "  🗑️   Cleared ${count} reminder(s)."
-            echo "  ⚠️   Note: clears ALL your at-jobs, not just sched reminders."
+            echo "  ⚠️   Note: clears ALL your at-jobs, not just remind reminders."
+        fi
+
+        # Also remove any persistent repeat payload scripts — these drive the repeat chain
+        # and must be deleted to fully stop a repeating reminder.
+        payload_dir="$HOME/.local/share/remind"
+        if compgen -G "${payload_dir}/repeat-*.sh" > /dev/null 2>&1; then
+            rm -f "${payload_dir}"/repeat-*.sh
+            echo "  🗑️   Cleared repeat payload scripts."
         fi
 
         echo ""
@@ -154,10 +164,6 @@ if [[ "${3:-}" == "repeat" ]]; then
     REPEAT=true
 fi
 
-# Resolve the path to this script using $0 so the at job can call it back.
-# $0 is the actual path used to invoke this script — works regardless of name or install location.
-SCHED_BIN=$(realpath "$0")
-
 # Pure integer → minutes from now; anything else passes straight to 'at'
 if [[ "$WHEN" =~ ^[0-9]+$ ]]; then
     AT_TIME="now + ${WHEN} minutes"
@@ -177,37 +183,55 @@ fi
 # handling double quotes, dollar signs, backticks, and spaces correctly.
 SAFE_MSG=$(printf '%q' "$MESSAGE")
 
-# Build the job script that 'at' will execute at the scheduled time.
-# MESSAGE is assigned via SAFE_MSG (shell-quoted) — never interpolated
-# directly into quoted strings — so no injection or quote-breakage is possible.
+# Build and submit the job.
 #
-# For repeat mode we append a self-reschedule line so the job re-queues itself
-# after firing. This chains one-shot at jobs into an indefinite loop.
-# The user stops it with: sched clear (or atrm <job-id>)
+# ONE-SHOT MODE: pipe the job script directly to 'at' via stdin.
+#
+# REPEAT MODE: write a persistent payload script to ~/.local/share/remind/
+# and schedule it with 'at -f <file>'. The payload script re-submits itself
+# via 'at -f' each time it fires — no subprocess call back to remind needed.
+# This is robust because: no set -euo pipefail inside the payload, no PATH
+# issues finding remind, and the file survives across firings.
+# Stop with: remind clear  (removes at jobs AND the payload file).
+
 if $REPEAT; then
-    # Repeat mode: fire notification + email, then re-queue at the same interval.
-    # SCHED_BIN is resolved at schedule time (not at fire time) to avoid PATH issues.
-    JOB=$(cat <<EOF
+    # Create the directory for persistent repeat payload scripts
+    PAYLOAD_DIR="$HOME/.local/share/remind"
+    mkdir -p "$PAYLOAD_DIR"
+    # mktemp guarantees a unique filename; safer than $RANDOM concatenation
+    PAYLOAD_FILE=$(mktemp "${PAYLOAD_DIR}/repeat-XXXXXX.sh")
+
+    # Write the payload script. All variables ($DISPLAY_VAR, $SAFE_MSG, etc.)
+    # are expanded NOW at schedule time and baked into the file.
+    # The last line re-submits this same file to 'at' using its full path,
+    # which is also baked in — no PATH lookup needed at fire time.
+    cat > "$PAYLOAD_FILE" <<EOF
 export DISPLAY="${DISPLAY_VAR}"
 export XAUTHORITY="${XAUTH_VAR}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_VAR}"
 SCHED_MSG=${SAFE_MSG}
 
-# Use full path so notify-send is found in at's minimal PATH
 /usr/bin/notify-send --urgency=normal --icon=dialog-information "🔁 Reminder (repeating)" "\$SCHED_MSG"
 
-# Email via msmtp — To: and Date: headers required for RFC 2822 compliance
-printf 'To: thomaslane2025@gmail.com\nSubject: Reminder (repeating): %s\nDate: %s\n\nReminder: %s\n\nThis is a repeating reminder (every ${WHEN} min). To stop: sched clear\n' \
-    "\$SCHED_MSG" "\$(date -R)" "\$SCHED_MSG" \
-    | msmtp -a gmail thomaslane2025@gmail.com
+printf 'To: thomaslane2025@gmail.com\nSubject: Reminder (repeating): %s\nDate: %s\n\nReminder: %s\n\nThis is a repeating reminder (every ${WHEN} min). To stop: remind clear\n' \\
+    "\$SCHED_MSG" "\$(date -R)" "\$SCHED_MSG" \\
+    | /usr/bin/msmtp -a gmail thomaslane2025@gmail.com
 
-# Self-reschedule: queue another identical job for the next interval.
-# Uses the resolved SCHED_BIN path captured at schedule time.
-${SCHED_BIN} "\$SCHED_MSG" ${WHEN} repeat
+# Re-submit this exact file to at — chains the next firing without calling remind
+/usr/bin/at now + ${WHEN} minutes -f "${PAYLOAD_FILE}"
 EOF
-)
+
+    # Schedule the first firing using at -f (reads from the payload file)
+    # $AT_TIME is unquoted so 'at' receives "now + N minutes" as separate words
+    if ! AT_OUTPUT=$(/usr/bin/at $AT_TIME -f "$PAYLOAD_FILE" 2>&1); then
+        echo ""
+        echo "  ❌  Failed to schedule reminder:"
+        echo "     $AT_OUTPUT" >&2
+        rm -f "$PAYLOAD_FILE"
+        exit 1
+    fi
 else
-    # One-shot mode: fire notification + email, done.
+    # One-shot mode: build the job inline and pipe to at via stdin
     JOB=$(cat <<EOF
 export DISPLAY="${DISPLAY_VAR}"
 export XAUTHORITY="${XAUTH_VAR}"
@@ -218,20 +242,19 @@ SCHED_MSG=${SAFE_MSG}
 /usr/bin/notify-send --urgency=normal --icon=dialog-information "Reminder" "\$SCHED_MSG"
 
 # Email via msmtp — To: and Date: headers required for RFC 2822 compliance
-printf 'To: thomaslane2025@gmail.com\nSubject: Reminder: %s\nDate: %s\n\nReminder: %s\n\nScheduled with sched.\n' \
+printf 'To: thomaslane2025@gmail.com\nSubject: Reminder: %s\nDate: %s\n\nReminder: %s\n\nScheduled with remind.\n' \
     "\$SCHED_MSG" "\$(date -R)" "\$SCHED_MSG" \
-    | msmtp -a gmail thomaslane2025@gmail.com
+    | /usr/bin/msmtp -a gmail thomaslane2025@gmail.com
 EOF
 )
-fi
-
-# Submit the job. 'if !' prevents set -e from firing before we can show the error.
-# 2>&1 captures at's stderr (errors AND the "job N at DATE" confirmation).
-if ! AT_OUTPUT=$(echo "$JOB" | at $AT_TIME 2>&1); then
-    echo ""
-    echo "  ❌  Failed to schedule reminder:"
-    echo "     $AT_OUTPUT" >&2
-    exit 1
+    # Submit the job. 'if !' prevents set -e from firing before we can show the error.
+    # 2>&1 captures at's stderr (errors AND the "job N at DATE" confirmation).
+    if ! AT_OUTPUT=$(echo "$JOB" | /usr/bin/at $AT_TIME 2>&1); then
+        echo ""
+        echo "  ❌  Failed to schedule reminder:"
+        echo "     $AT_OUTPUT" >&2
+        exit 1
+    fi
 fi
 
 echo ""
@@ -239,7 +262,7 @@ if $REPEAT; then
     echo "  ✅  Repeating reminder scheduled every ${WHEN} minute(s):"
     echo "     \"${MESSAGE}\""
     echo "     (desktop popup + email — repeats forever)"
-    echo "     To stop: sched clear  (or atrm <job-id>)"
+    echo "     To stop: remind clear  (removes at job + payload file)"
 else
     echo "  ✅  Reminder scheduled ${HUMAN_TIME}:"
     echo "     \"${MESSAGE}\""
@@ -259,6 +282,8 @@ echo ""
 # DISPLAY          — X11 screen address; must be exported for GUI tools in cron/at
 # DBUS_SESSION_BUS_ADDRESS — message bus for notify-send; empty outside login session
 # RFC 2822         — email format standard; requires To: Subject: Date: headers
-# self-rescheduling — repeat mode calls 'sched' from inside the at job so each
-#                    firing queues the next; 'at' has no built-in repeat mechanism
+# persistent payload  — repeat mode writes a shell script to ~/.local/share/remind/
+#                    and schedules it with 'at -f'; the script re-submits itself
+#                    each firing — no dependency on remind being on PATH in at context
+# at -f <file>       — tells 'at' to read the job script from a file instead of stdin
 # ============================================================
