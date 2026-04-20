@@ -9,8 +9,11 @@
 set -euo pipefail  # exit on error, undefined var, or pipe failure
 
 # Capture display/session env vars now so the at job can reach the desktop.
+# All three are required: DISPLAY (which screen), XAUTHORITY (X11 auth cookie),
+# and DBUS_SESSION_BUS_ADDRESS (message bus that notify-send talks to).
 DISPLAY_VAR="${DISPLAY:-:0}"
-DBUS_VAR="${DBUS_SESSION_BUS_ADDRESS:-}"
+XAUTH_VAR="${XAUTHORITY:-$HOME/.Xauthority}"
+DBUS_VAR="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
 
 # ------------------------------------------------------------------
 # usage() — shown when args are missing or wrong
@@ -158,11 +161,12 @@ SAFE_MSG=$(printf '%q' "$MESSAGE")
 # directly into quoted strings — so no injection or quote-breakage is possible.
 JOB=$(cat <<EOF
 export DISPLAY="${DISPLAY_VAR}"
+export XAUTHORITY="${XAUTH_VAR}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_VAR}"
 SCHED_MSG=${SAFE_MSG}
 
-# Desktop popup
-notify-send --urgency=normal --icon=dialog-information "Reminder" "\$SCHED_MSG"
+# Use full path so notify-send is found in at's minimal PATH
+/usr/bin/notify-send --urgency=normal --icon=dialog-information "Reminder" "\$SCHED_MSG"
 
 # Email via msmtp — To: and Date: headers required for RFC 2822 compliance
 printf 'To: thomaslane2025@gmail.com\nSubject: Reminder: %s\nDate: %s\n\nReminder: %s\n\nScheduled with sched.\n' \
