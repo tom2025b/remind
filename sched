@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# ============================================================
+# sched — friendly desktop reminder scheduler using 'at'
+# Schedules both a desktop popup AND an email at the same time.
+# Jobs survive terminal close; atd re-queues them across reboots.
+# Usage: sched "msg" <minutes|time>  |  sched list  |  sched clear
+# ============================================================
+
+set -euo pipefail  # exit on error, undefined var, or pipe failure
+
+# Capture display/session env vars now so the at job can reach the desktop.
+DISPLAY_VAR="${DISPLAY:-:0}"
+DBUS_VAR="${DBUS_SESSION_BUS_ADDRESS:-}"
+
+# ------------------------------------------------------------------
+# usage() — shown when args are missing or wrong
+# ------------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+
+  📅  sched — schedule desktop reminders
+
+  Commands:
+    sched "message" 25              → remind in 25 minutes
+    sched "message" 14:30          → remind at 2:30 PM today
+    sched "message" "Monday 09:00" → remind next Monday at 9 AM
+    sched list                     → show pending reminders (all at-jobs)
+    sched clear                    → cancel ALL pending at-jobs for your user
+
+EOF
+    exit 1
+}
+
+[[ $# -eq 0 ]] && usage
+
+# ------------------------------------------------------------------
+# Subcommands: list and clear
+# ------------------------------------------------------------------
+case "$1" in
+
+    list)
+        echo ""
+        count=$(atq | wc -l)
+
+        if [[ "$count" -eq 0 ]]; then
+            echo "  ✅  No reminders scheduled."
+            echo ""
+            exit 0
+        fi
+
+        echo "  📋  Pending reminders (${count} total):"
+        echo ""
+
+        # Write atq output to a temp file so we can read it twice
+        # (a while-pipe subshell can't export variables to the parent)
+        tmpfile=$(mktemp)
+        atq > "$tmpfile"
+
+        idx=1
+        while read -r line; do
+            job_id=$(echo "$line" | awk '{print $1}')
+            job_time=$(echo "$line" | awk '{print $2, $3, $4, $5}')
+            echo "    [$idx]  🔔  Job #${job_id} — ${job_time}"
+            # Store display-index → real job-id mapping for deletion lookup
+            echo "${idx}=${job_id}" >> "${tmpfile}.map"
+            idx=$(( idx + 1 ))   # plain arithmetic avoids set -e on (( )) edge case
+        done < "$tmpfile"
+
+        echo ""
+        echo "  Enter a number to delete that reminder, or press Enter to quit:"
+        printf "  > "
+        read -r choice
+
+        if [[ -z "$choice" ]]; then
+            echo "  👋  No changes made."
+            echo ""
+            rm -f "$tmpfile" "${tmpfile}.map"
+            exit 0
+        fi
+
+        # Reject non-integer input before using it in any lookup
+        if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+            echo "  ❌  Please enter a number."
+            echo ""
+            rm -f "$tmpfile" "${tmpfile}.map"
+            exit 1
+        fi
+
+        # Use awk exact field match — avoids regex injection if user enters . or [0-9]
+        real_id=$(awk -F= -v idx="$choice" '$1 == idx { print $2 }' "${tmpfile}.map" 2>/dev/null)
+
+        if [[ -z "$real_id" ]]; then
+            echo "  ❌  \"$choice\" isn't in the list — nothing deleted."
+        else
+            # Guard against race where the job already expired between list and delete
+            if ! atrm "$real_id" 2>/dev/null; then
+                echo "  ⚠️   Job ${real_id} could not be removed (already expired?)."
+            else
+                echo "  🗑️   Reminder #${choice} (Job ${real_id}) deleted."
+            fi
+        fi
+
+        echo ""
+        rm -f "$tmpfile" "${tmpfile}.map"
+        exit 0
+        ;;
+
+    clear)
+        echo ""
+        ids=$(atq | awk '{print $1}')
+
+        if [[ -z "$ids" ]]; then
+            echo "  ✅  No reminders to clear."
+        else
+            # || true prevents set -e from aborting if any job already expired mid-clear
+            echo "$ids" | xargs -r atrm 2>/dev/null || true
+            count=$(echo "$ids" | wc -l)
+            echo "  🗑️   Cleared ${count} reminder(s)."
+            echo "  ⚠️   Note: clears ALL your at-jobs, not just sched reminders."
+        fi
+
+        echo ""
+        exit 0
+        ;;
+esac
+
+# ------------------------------------------------------------------
+# Schedule a new reminder — requires exactly 2 arguments
+# ------------------------------------------------------------------
+[[ $# -lt 2 ]] && usage
+
+# Strip newlines from the message — a newline inside the Subject: header
+# would corrupt the email (RFC 2822 header injection).
+MESSAGE="${1//$'\n'/ }"
+WHEN="$2"
+
+# Pure integer → minutes from now; anything else passes straight to 'at'
+if [[ "$WHEN" =~ ^[0-9]+$ ]]; then
+    AT_TIME="now + ${WHEN} minutes"
+    HUMAN_TIME="in ${WHEN} minute(s)"
+else
+    AT_TIME="$WHEN"       # e.g. "14:30" or "Monday 09:00"
+    HUMAN_TIME="at $WHEN"
+fi
+
+# Warn early if DBUS is missing — notify-send will silently fail without it
+if [[ -z "$DBUS_VAR" ]]; then
+    echo "  ⚠️   DBUS_SESSION_BUS_ADDRESS not set — desktop popup may not appear."
+fi
+
+# Shell-quote MESSAGE so it's safe to embed in the job script.
+# printf '%q' produces a form the shell can re-read without injection risks,
+# handling double quotes, dollar signs, backticks, and spaces correctly.
+SAFE_MSG=$(printf '%q' "$MESSAGE")
+
+# Build the job script that 'at' will execute at the scheduled time.
+# MESSAGE is assigned via SAFE_MSG (shell-quoted) — never interpolated
+# directly into quoted strings — so no injection or quote-breakage is possible.
+JOB=$(cat <<EOF
+export DISPLAY="${DISPLAY_VAR}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_VAR}"
+SCHED_MSG=${SAFE_MSG}
+
+# Desktop popup
+notify-send --urgency=normal --icon=dialog-information "Reminder" "\$SCHED_MSG"
+
+# Email via msmtp — To: and Date: headers required for RFC 2822 compliance
+printf 'To: thomaslane2025@gmail.com\nSubject: Reminder: %s\nDate: %s\n\nReminder: %s\n\nScheduled with sched.\n' \
+    "\$SCHED_MSG" "\$(date -R)" "\$SCHED_MSG" \
+    | msmtp -a gmail thomaslane2025@gmail.com
+EOF
+)
+
+# Submit the job. 'if !' prevents set -e from firing before we can show the error.
+# 2>&1 captures at's stderr (errors AND the "job N at DATE" confirmation).
+if ! AT_OUTPUT=$(echo "$JOB" | at $AT_TIME 2>&1); then
+    echo ""
+    echo "  ❌  Failed to schedule reminder:"
+    echo "     $AT_OUTPUT" >&2
+    exit 1
+fi
+
+echo ""
+echo "  ✅  Reminder scheduled ${HUMAN_TIME}:"
+echo "     \"${MESSAGE}\""
+echo "     (desktop popup + email)"
+echo ""
+
+# ============================================================
+# Learning Notes
+# ============================================================
+# at / atq / atrm  — one-shot scheduler daemon; jobs survive reboots
+# notify-send      — sends a desktop popup via the notification daemon
+# msmtp            — lightweight SMTP client; reads raw email from stdin
+# printf '%q'      — shell-quotes a string so it survives re-evaluation;
+#                    prevents injection via $(), backticks, or quotes in the msg
+# set -euo pipefail — strict mode: abort on first error, undefined var, or pipe fail
+# DISPLAY          — X11 screen address; must be exported for GUI tools in cron/at
+# DBUS_SESSION_BUS_ADDRESS — message bus for notify-send; empty outside login session
+# RFC 2822         — email format standard; requires To: Subject: Date: headers
+# ============================================================
