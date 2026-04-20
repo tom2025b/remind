@@ -4,6 +4,7 @@
 # Schedules both a desktop popup AND an email at the same time.
 # Jobs survive terminal close; atd re-queues them across reboots.
 # Usage: remind "msg" <minutes|time>  |  remind list  |  remind clear
+#        remind "msg" <minutes> repeat  →  repeats every N minutes forever
 # ============================================================
 
 set -euo pipefail  # exit on error, undefined var, or pipe failure
@@ -27,6 +28,7 @@ usage() {
     sched "message" 25              → remind in 25 minutes
     sched "message" 14:30          → remind at 2:30 PM today
     sched "message" "Monday 09:00" → remind next Monday at 9 AM
+    sched "message" 25 repeat       → remind every 25 minutes (repeats forever)
     remind list                     → show pending reminders (all at-jobs)
     remind clear                    → cancel ALL pending at-jobs for your user
 
@@ -137,6 +139,25 @@ esac
 MESSAGE="${1//$'\n'/ }"
 WHEN="$2"
 
+# Optional 3rd argument: "repeat" — re-schedules itself each time it fires.
+# Only supported with integer (minute) intervals since we need a fixed delay
+# to self-reschedule inside the at job.
+REPEAT=false
+if [[ "${3:-}" == "repeat" ]]; then
+    if [[ ! "$WHEN" =~ ^[0-9]+$ ]]; then
+        echo ""
+        echo "  ❌  'repeat' only works with a minute count (e.g. sched \"msg\" 25 repeat)"
+        echo "     Clock times like 14:30 can't self-repeat reliably."
+        echo ""
+        exit 1
+    fi
+    REPEAT=true
+fi
+
+# Resolve the path to this script now (at job's PATH is minimal).
+# Falls back to ~/.local/bin/sched if the command isn't on PATH yet.
+SCHED_BIN=$(command -v sched 2>/dev/null || echo "$HOME/.local/bin/sched")
+
 # Pure integer → minutes from now; anything else passes straight to 'at'
 if [[ "$WHEN" =~ ^[0-9]+$ ]]; then
     AT_TIME="now + ${WHEN} minutes"
@@ -159,7 +180,35 @@ SAFE_MSG=$(printf '%q' "$MESSAGE")
 # Build the job script that 'at' will execute at the scheduled time.
 # MESSAGE is assigned via SAFE_MSG (shell-quoted) — never interpolated
 # directly into quoted strings — so no injection or quote-breakage is possible.
-JOB=$(cat <<EOF
+#
+# For repeat mode we append a self-reschedule line so the job re-queues itself
+# after firing. This chains one-shot at jobs into an indefinite loop.
+# The user stops it with: sched clear (or atrm <job-id>)
+if $REPEAT; then
+    # Repeat mode: fire notification + email, then re-queue at the same interval.
+    # SCHED_BIN is resolved at schedule time (not at fire time) to avoid PATH issues.
+    JOB=$(cat <<EOF
+export DISPLAY="${DISPLAY_VAR}"
+export XAUTHORITY="${XAUTH_VAR}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_VAR}"
+SCHED_MSG=${SAFE_MSG}
+
+# Use full path so notify-send is found in at's minimal PATH
+/usr/bin/notify-send --urgency=normal --icon=dialog-information "🔁 Reminder (repeating)" "\$SCHED_MSG"
+
+# Email via msmtp — To: and Date: headers required for RFC 2822 compliance
+printf 'To: thomaslane2025@gmail.com\nSubject: Reminder (repeating): %s\nDate: %s\n\nReminder: %s\n\nThis is a repeating reminder (every ${WHEN} min). To stop: sched clear\n' \
+    "\$SCHED_MSG" "\$(date -R)" "\$SCHED_MSG" \
+    | msmtp -a gmail thomaslane2025@gmail.com
+
+# Self-reschedule: queue another identical job for the next interval.
+# Uses the resolved SCHED_BIN path captured at schedule time.
+${SCHED_BIN} "\$SCHED_MSG" ${WHEN} repeat
+EOF
+)
+else
+    # One-shot mode: fire notification + email, done.
+    JOB=$(cat <<EOF
 export DISPLAY="${DISPLAY_VAR}"
 export XAUTHORITY="${XAUTH_VAR}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_VAR}"
@@ -174,6 +223,7 @@ printf 'To: thomaslane2025@gmail.com\nSubject: Reminder: %s\nDate: %s\n\nReminde
     | msmtp -a gmail thomaslane2025@gmail.com
 EOF
 )
+fi
 
 # Submit the job. 'if !' prevents set -e from firing before we can show the error.
 # 2>&1 captures at's stderr (errors AND the "job N at DATE" confirmation).
@@ -185,9 +235,16 @@ if ! AT_OUTPUT=$(echo "$JOB" | at $AT_TIME 2>&1); then
 fi
 
 echo ""
-echo "  ✅  Reminder scheduled ${HUMAN_TIME}:"
-echo "     \"${MESSAGE}\""
-echo "     (desktop popup + email)"
+if $REPEAT; then
+    echo "  ✅  Repeating reminder scheduled every ${WHEN} minute(s):"
+    echo "     \"${MESSAGE}\""
+    echo "     (desktop popup + email — repeats forever)"
+    echo "     To stop: sched clear  (or atrm <job-id>)"
+else
+    echo "  ✅  Reminder scheduled ${HUMAN_TIME}:"
+    echo "     \"${MESSAGE}\""
+    echo "     (desktop popup + email)"
+fi
 echo ""
 
 # ============================================================
@@ -202,4 +259,6 @@ echo ""
 # DISPLAY          — X11 screen address; must be exported for GUI tools in cron/at
 # DBUS_SESSION_BUS_ADDRESS — message bus for notify-send; empty outside login session
 # RFC 2822         — email format standard; requires To: Subject: Date: headers
+# self-rescheduling — repeat mode calls 'sched' from inside the at job so each
+#                    firing queues the next; 'at' has no built-in repeat mechanism
 # ============================================================
