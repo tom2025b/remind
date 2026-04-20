@@ -3,7 +3,7 @@
 # sched — friendly desktop reminder scheduler using 'at'
 # Schedules both a desktop popup AND an email at the same time.
 # Jobs survive terminal close; atd re-queues them across reboots.
-# Usage: sched "msg" <minutes|time>  |  sched list  |  sched clear
+# Usage: remind "msg" <minutes|time>  |  remind list  |  remind clear
 # ============================================================
 
 set -euo pipefail  # exit on error, undefined var, or pipe failure
@@ -24,8 +24,8 @@ usage() {
     sched "message" 25              → remind in 25 minutes
     sched "message" 14:30          → remind at 2:30 PM today
     sched "message" "Monday 09:00" → remind next Monday at 9 AM
-    sched list                     → show pending reminders (all at-jobs)
-    sched clear                    → cancel ALL pending at-jobs for your user
+    remind list                     → show pending reminders (all at-jobs)
+    remind clear                    → cancel ALL pending at-jobs for your user
 
 EOF
     exit 1
