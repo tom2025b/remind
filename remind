@@ -56,10 +56,7 @@ case "$1" in
         echo "  📋  Pending reminders (${count} total):"
         echo ""
 
-        # Write atq output to a temp file so we can read it twice
-        # (a while-pipe subshell can't export variables to the parent)
         tmpfile=$(mktemp)
-        # Trap ensures tmpfiles are always cleaned up even if set -e aborts mid-list
         trap 'rm -f "$tmpfile" "${tmpfile}.map"' EXIT
         atq > "$tmpfile"
 
@@ -67,14 +64,34 @@ case "$1" in
         while read -r line; do
             job_id=$(echo "$line" | awk '{print $1}')
             job_time=$(echo "$line" | awk '{print $2, $3, $4, $5}')
-            echo "    [$idx]  🔔  Job #${job_id} — ${job_time}"
-            # Store display-index → real job-id mapping for deletion lookup
-            echo "${idx}=${job_id}" >> "${tmpfile}.map"
-            idx=$(( idx + 1 ))   # plain arithmetic avoids set -e on (( )) edge case
+
+            # 'at -c' prints the full queued script — lets us detect type and extract message
+            job_script=$(at -c "$job_id" 2>/dev/null)
+
+            # SCHED_MSG= is baked into every remind job; strip the key and unescape for display
+            raw_msg=$(echo "$job_script" | grep '^SCHED_MSG=' | head -1 | cut -d= -f2-)
+            display_msg=$(echo "$raw_msg" | sed 's/\\//g')
+
+            # Repeat jobs contain a self-requeue line referencing the payload file
+            requeue_line=$(echo "$job_script" | grep '/usr/bin/at -f.*remind/repeat-' | head -1)
+
+            if [[ -n "$requeue_line" ]]; then
+                interval=$(echo "$requeue_line" | grep -oP 'now \+ \K[0-9]+')
+                # Extract the quoted path between -f "..." and " now"
+                payload=$(echo "$requeue_line" | sed 's|.* -f "\([^"]*\)" now.*|\1|')
+                echo "    [$idx]  🔁  Job #${job_id} — ${job_time} — repeating every ${interval} min"
+                [[ -n "$display_msg" ]] && echo "         \"${display_msg}\""
+                echo "${idx}=${job_id}=${payload}" >> "${tmpfile}.map"
+            else
+                echo "    [$idx]  🔔  Job #${job_id} — ${job_time}"
+                [[ -n "$display_msg" ]] && echo "         \"${display_msg}\""
+                echo "${idx}=${job_id}=" >> "${tmpfile}.map"
+            fi
+            idx=$(( idx + 1 ))
         done < "$tmpfile"
 
         echo ""
-        echo "  Enter a number to delete that reminder, or press Enter to quit:"
+        echo "  Enter a number to cancel that reminder, or press Enter to quit:"
         printf "  > "
         read -r choice
 
@@ -85,7 +102,6 @@ case "$1" in
             exit 0
         fi
 
-        # Reject non-integer input before using it in any lookup
         if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
             echo "  ❌  Please enter a number."
             echo ""
@@ -93,17 +109,24 @@ case "$1" in
             exit 1
         fi
 
-        # Use awk exact field match — avoids regex injection if user enters . or [0-9]
-        real_id=$(awk -F= -v idx="$choice" '$1 == idx { print $2 }' "${tmpfile}.map" 2>/dev/null)
+        # Map file format: idx=job_id=payload_path (payload_path empty for one-shot jobs)
+        map_line=$(awk -F= -v idx="$choice" '$1 == idx { print }' "${tmpfile}.map" 2>/dev/null)
+        real_id=$(echo "$map_line" | cut -d= -f2)
+        payload_file=$(echo "$map_line" | cut -d= -f3-)
 
         if [[ -z "$real_id" ]]; then
-            echo "  ❌  \"$choice\" isn't in the list — nothing deleted."
+            echo "  ❌  \"$choice\" isn't in the list — nothing cancelled."
         else
-            # Guard against race where the job already expired between list and delete
             if ! atrm "$real_id" 2>/dev/null; then
                 echo "  ⚠️   Job ${real_id} could not be removed (already expired?)."
             else
-                echo "  🗑️   Reminder #${choice} (Job ${real_id}) deleted."
+                if [[ -n "$payload_file" && -f "$payload_file" ]]; then
+                    # Remove the payload file so the repeat chain can't be re-queued again
+                    rm -f "$payload_file"
+                    echo "  🗑️   Repeating reminder #${choice} cancelled (job + repeat script removed)."
+                else
+                    echo "  🗑️   Reminder #${choice} (Job ${real_id}) cancelled."
+                fi
             fi
         fi
 
