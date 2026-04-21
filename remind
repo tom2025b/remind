@@ -213,7 +213,7 @@ SCHED_MSG=${SAFE_MSG}
 
 # Re-submit FIRST — the chain must continue regardless of what notifications do.
 # If this fails, log it so the failure isn't silent.
-/usr/bin/at now + ${WHEN} minutes -f "${PAYLOAD_FILE}" 2>/dev/null || \
+/usr/bin/at -f "${PAYLOAD_FILE}" now + ${WHEN} minutes 2>/dev/null || \
     echo "remind repeat failed to re-queue at \$(date)" >> "${PAYLOAD_FILE}.err"
 
 # Notifications are non-critical — || true ensures they never kill the script.
@@ -228,7 +228,7 @@ EOF
 
     # Schedule the first firing using at -f (reads from the payload file)
     # $AT_TIME is unquoted so 'at' receives "now + N minutes" as separate words
-    if ! AT_OUTPUT=$(/usr/bin/at $AT_TIME -f "$PAYLOAD_FILE" 2>&1); then
+    if ! AT_OUTPUT=$(/usr/bin/at -f "$PAYLOAD_FILE" $AT_TIME 2>&1); then
         echo ""
         echo "  ❌  Failed to schedule reminder:"
         echo "     $AT_OUTPUT" >&2
