@@ -172,6 +172,15 @@ esac
 MESSAGE="${1//$'\n'/ }"
 WHEN="$2"
 
+# Catch swapped args: remind "msg" repeat 30 → should be remind "msg" 30 repeat
+if [[ "$WHEN" == "repeat" && "${3:-}" =~ ^[0-9]+$ ]]; then
+    echo ""
+    echo "  ❌  Wrong order — minutes comes before 'repeat':"
+    echo "     remind \"${MESSAGE}\" ${3} repeat"
+    echo ""
+    exit 1
+fi
+
 # Optional 3rd argument: "repeat" — re-schedules itself each time it fires.
 # Only supported with integer (minute) intervals since we need a fixed delay
 # to self-reschedule inside the at job.
