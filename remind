@@ -234,9 +234,8 @@ export XAUTHORITY="${XAUTH_VAR}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_VAR}"
 SCHED_MSG=${SAFE_MSG}
 
-# Re-submit FIRST — the chain must continue regardless of what notifications do.
-# If this fails, log it so the failure isn't silent.
-/usr/bin/at -f "${PAYLOAD_FILE}" now + ${WHEN} minutes 2>/dev/null || \
+# Re-submit FIRST via stdin pipe — more reliable than at -f when called from inside an at job.
+/bin/cat "${PAYLOAD_FILE}" | /usr/bin/at now + ${WHEN} minutes 2>/dev/null || \
     echo "remind repeat failed to re-queue at \$(date)" >> "${PAYLOAD_FILE}.err"
 
 # Notifications are non-critical — || true ensures they never kill the script.
