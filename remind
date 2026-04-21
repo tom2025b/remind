@@ -44,94 +44,88 @@ EOF
 case "$1" in
 
     list)
-        echo ""
-        count=$(atq | wc -l)
-
-        if [[ "$count" -eq 0 ]]; then
-            echo "  ✅  No reminders scheduled."
+        while true; do
             echo ""
-            exit 0
-        fi
+            tmpfile=$(mktemp)
+            mapfile="${tmpfile}.map"
+            atq > "$tmpfile"
+            count=$(wc -l < "$tmpfile")
 
-        echo "  📋  Pending reminders (${count} total):"
-        echo ""
-
-        tmpfile=$(mktemp)
-        trap 'rm -f "$tmpfile" "${tmpfile}.map"' EXIT
-        atq > "$tmpfile"
-
-        idx=1
-        while read -r line; do
-            job_id=$(echo "$line" | awk '{print $1}')
-            job_time=$(echo "$line" | awk '{print $2, $3, $4, $5}')
-
-            # 'at -c' prints the full queued script — lets us detect type and extract message
-            job_script=$(at -c "$job_id" 2>/dev/null || true)
-
-            # || true on all grep pipelines — grep exits 1 on no match, which would trigger set -e
-            raw_msg=$(echo "$job_script" | grep '^SCHED_MSG=' | head -1 | cut -d= -f2- || true)
-            display_msg=$(echo "$raw_msg" | sed 's/\\//g')
-
-            # Repeat jobs use "cat payload | at" for re-queuing (the payload path is unique per job)
-            requeue_line=$(echo "$job_script" | grep '/bin/cat.*remind/repeat-' | head -1 || true)
-
-            if [[ -n "$requeue_line" ]]; then
-                interval=$(echo "$requeue_line" | grep -oP 'now \+ \K[0-9]+' || true)
-                # Extract the quoted path between cat "..." and the pipe
-                payload=$(echo "$requeue_line" | sed 's|.*/bin/cat "\([^"]*\)".*|\1|')
-                echo "    [$idx]  🔁  Job #${job_id} — ${job_time} — repeating every ${interval} min"
-                [[ -n "$display_msg" ]] && echo "         \"${display_msg}\""
-                echo "${idx}=${job_id}=${payload}" >> "${tmpfile}.map"
-            else
-                echo "    [$idx]  🔔  Job #${job_id} — ${job_time}"
-                [[ -n "$display_msg" ]] && echo "         \"${display_msg}\""
-                echo "${idx}=${job_id}=" >> "${tmpfile}.map"
+            if [[ "$count" -eq 0 ]]; then
+                echo "  ✅  No reminders scheduled."
+                echo ""
+                rm -f "$tmpfile" "$mapfile"
+                exit 0
             fi
-            idx=$(( idx + 1 ))
-        done < "$tmpfile"
 
-        echo ""
-        echo "  Enter a number to cancel that reminder, or press Enter to quit:"
-        printf "  > "
-        read -r choice
-
-        if [[ -z "$choice" ]]; then
-            echo "  👋  No changes made."
+            echo "  📋  Pending reminders (${count} total):"
             echo ""
-            rm -f "$tmpfile" "${tmpfile}.map"
-            exit 0
-        fi
 
-        if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
-            echo "  ❌  Please enter a number."
-            echo ""
-            rm -f "$tmpfile" "${tmpfile}.map"
-            exit 1
-        fi
+            idx=1
+            while read -r line; do
+                job_id=$(echo "$line" | awk '{print $1}')
+                job_time=$(echo "$line" | awk '{print $2, $3, $4, $5}')
 
-        # Map file format: idx=job_id=payload_path (payload_path empty for one-shot jobs)
-        map_line=$(awk -F= -v idx="$choice" '$1 == idx { print }' "${tmpfile}.map" 2>/dev/null)
-        real_id=$(echo "$map_line" | cut -d= -f2)
-        payload_file=$(echo "$map_line" | cut -d= -f3-)
+                job_script=$(at -c "$job_id" 2>/dev/null || true)
+                raw_msg=$(echo "$job_script" | grep '^SCHED_MSG=' | head -1 | cut -d= -f2- || true)
+                display_msg=$(echo "$raw_msg" | sed 's/\\//g')
+                requeue_line=$(echo "$job_script" | grep '/bin/cat.*remind/repeat-' | head -1 || true)
 
-        if [[ -z "$real_id" ]]; then
-            echo "  ❌  \"$choice\" isn't in the list — nothing cancelled."
-        else
-            if ! atrm "$real_id" 2>/dev/null; then
-                echo "  ⚠️   Job ${real_id} could not be removed (already expired?)."
-            else
-                if [[ -n "$payload_file" && -f "$payload_file" ]]; then
-                    # Remove the payload file so the repeat chain can't be re-queued again
-                    rm -f "$payload_file"
-                    echo "  🗑️   Repeating reminder #${choice} cancelled (job + repeat script removed)."
+                if [[ -n "$requeue_line" ]]; then
+                    interval=$(echo "$requeue_line" | grep -oP 'now \+ \K[0-9]+' || true)
+                    payload=$(echo "$requeue_line" | sed 's|.*/bin/cat "\([^"]*\)".*|\1|')
+                    echo "    [$idx]  🔁  Job #${job_id} — ${job_time} — repeating every ${interval} min"
+                    [[ -n "$display_msg" ]] && echo "         \"${display_msg}\""
+                    echo "${idx}=${job_id}=${payload}" >> "$mapfile"
                 else
-                    echo "  🗑️   Reminder #${choice} (Job ${real_id}) cancelled."
+                    echo "    [$idx]  🔔  Job #${job_id} — ${job_time}"
+                    [[ -n "$display_msg" ]] && echo "         \"${display_msg}\""
+                    echo "${idx}=${job_id}=" >> "$mapfile"
+                fi
+                idx=$(( idx + 1 ))
+            done < "$tmpfile"
+
+            echo ""
+            echo "    [0]  Exit"
+            echo ""
+            printf "  Cancel which reminder? > "
+            read -r choice
+
+            # 0 or empty = exit
+            if [[ -z "$choice" || "$choice" == "0" ]]; then
+                echo ""
+                rm -f "$tmpfile" "$mapfile"
+                exit 0
+            fi
+
+            if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+                echo "  ❌  Please enter a number."
+                rm -f "$tmpfile" "$mapfile"
+                continue
+            fi
+
+            map_line=$(awk -F= -v idx="$choice" '$1 == idx { print }' "$mapfile" 2>/dev/null)
+            real_id=$(echo "$map_line" | cut -d= -f2)
+            payload_file=$(echo "$map_line" | cut -d= -f3-)
+
+            if [[ -z "$real_id" ]]; then
+                echo "  ❌  \"$choice\" isn't in the list."
+            else
+                if ! atrm "$real_id" 2>/dev/null; then
+                    echo "  ⚠️   Job ${real_id} could not be removed (already expired?)."
+                else
+                    if [[ -n "$payload_file" && -f "$payload_file" ]]; then
+                        rm -f "$payload_file"
+                        echo "  🗑️   Repeating reminder #${choice} cancelled."
+                    else
+                        echo "  🗑️   Reminder #${choice} cancelled."
+                    fi
                 fi
             fi
-        fi
 
-        echo ""
-        rm -f "$tmpfile" "${tmpfile}.map"
+            rm -f "$tmpfile" "$mapfile"
+            # loop: redisplay updated list
+        done
         exit 0
         ;;
 
