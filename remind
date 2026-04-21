@@ -211,14 +211,19 @@ export XAUTHORITY="${XAUTH_VAR}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_VAR}"
 SCHED_MSG=${SAFE_MSG}
 
-/usr/bin/notify-send --urgency=normal --icon=dialog-information "🔁 Reminder (repeating)" "\$SCHED_MSG"
+# Re-submit FIRST — the chain must continue regardless of what notifications do.
+# If this fails, log it so the failure isn't silent.
+/usr/bin/at now + ${WHEN} minutes -f "${PAYLOAD_FILE}" 2>/dev/null || \
+    echo "remind repeat failed to re-queue at \$(date)" >> "${PAYLOAD_FILE}.err"
 
+# Notifications are non-critical — || true ensures they never kill the script.
+/usr/bin/notify-send --urgency=normal --icon=dialog-information "🔁 Reminder (repeating)" "\$SCHED_MSG" 2>/dev/null || true
+
+# Note: \\ in this heredoc produces a single \ in the written file (line continuation).
+# Do NOT change \\ to \ here — the heredoc would swallow it and break the printf.
 printf 'To: thomaslane2025@gmail.com\nSubject: Reminder (repeating): %s\nDate: %s\n\nReminder: %s\n\nThis is a repeating reminder (every ${WHEN} min). To stop: remind clear\n' \\
     "\$SCHED_MSG" "\$(date -R)" "\$SCHED_MSG" \\
-    | /usr/bin/msmtp -a gmail thomaslane2025@gmail.com
-
-# Re-submit this exact file to at — chains the next firing without calling remind
-/usr/bin/at now + ${WHEN} minutes -f "${PAYLOAD_FILE}"
+    | /usr/bin/msmtp -a gmail thomaslane2025@gmail.com 2>/dev/null || true
 EOF
 
     # Schedule the first firing using at -f (reads from the payload file)
