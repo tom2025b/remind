@@ -66,19 +66,19 @@ case "$1" in
             job_time=$(echo "$line" | awk '{print $2, $3, $4, $5}')
 
             # 'at -c' prints the full queued script — lets us detect type and extract message
-            job_script=$(at -c "$job_id" 2>/dev/null)
+            job_script=$(at -c "$job_id" 2>/dev/null || true)
 
-            # SCHED_MSG= is baked into every remind job; strip the key and unescape for display
-            raw_msg=$(echo "$job_script" | grep '^SCHED_MSG=' | head -1 | cut -d= -f2-)
+            # || true on all grep pipelines — grep exits 1 on no match, which would trigger set -e
+            raw_msg=$(echo "$job_script" | grep '^SCHED_MSG=' | head -1 | cut -d= -f2- || true)
             display_msg=$(echo "$raw_msg" | sed 's/\\//g')
 
-            # Repeat jobs contain a self-requeue line referencing the payload file
-            requeue_line=$(echo "$job_script" | grep '/usr/bin/at -f.*remind/repeat-' | head -1)
+            # Repeat jobs use "cat payload | at" for re-queuing (the payload path is unique per job)
+            requeue_line=$(echo "$job_script" | grep '/bin/cat.*remind/repeat-' | head -1 || true)
 
             if [[ -n "$requeue_line" ]]; then
-                interval=$(echo "$requeue_line" | grep -oP 'now \+ \K[0-9]+')
-                # Extract the quoted path between -f "..." and " now"
-                payload=$(echo "$requeue_line" | sed 's|.* -f "\([^"]*\)" now.*|\1|')
+                interval=$(echo "$requeue_line" | grep -oP 'now \+ \K[0-9]+' || true)
+                # Extract the quoted path between cat "..." and the pipe
+                payload=$(echo "$requeue_line" | sed 's|.*/bin/cat "\([^"]*\)".*|\1|')
                 echo "    [$idx]  🔁  Job #${job_id} — ${job_time} — repeating every ${interval} min"
                 [[ -n "$display_msg" ]] && echo "         \"${display_msg}\""
                 echo "${idx}=${job_id}=${payload}" >> "${tmpfile}.map"
